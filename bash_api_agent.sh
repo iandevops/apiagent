@@ -149,7 +149,8 @@ from datetime import datetime, timedelta
 import glob
 import time
 import requests # For sending data to Django backend
-import threading
+import threading # For collection_lock
+
 # Load environment variables from .env file in the same directory
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
 load_dotenv(dotenv_path)
@@ -160,7 +161,7 @@ app = Flask(__name__)
 FLASK_HOST = os.getenv('FLASK_HOST', '127.0.0.1')
 FLASK_PORT = int(os.getenv('FLASK_PORT', 5858))
 LOG_FILE = os.getenv('LOG_FILE', 'agent.log') # Make sure this path is writable by the API_USER
-API_KEY = os.getenv('API_KEY') # Loaded from .env (for authentication of this Flask app)
+API_KEY = os.getenv('API_KEY') # Loaded from .env
 
 # --- New LVE Collection Configuration ---
 LVE_COLLECTION_INTERVAL_SECONDS = int(os.getenv('LVE_COLLECTION_INTERVAL_SECONDS', 60)) # How often to trigger collection (e.g., every minute)
@@ -169,8 +170,8 @@ LVE_FILE_LIFETIME_MINUTES = int(os.getenv('LVE_FILE_LIFETIME_MINUTES', 6)) # How
 LVE_DATA_DIR = os.getenv('LVE_DATA_DIR', '/tmp/lve_data') # Directory for temporary data files
 
 # Django Backend API Configuration
-BACKEND_API = os.getenv('BACKEND_API', 'http://localhost:8000/api/') # Ensure trailing slash
-BACKEND_API_KEY = os.getenv('API_KEY') # API Key for Flask to authenticate with Django
+DJANGO_API_BASE_URL = os.getenv('DJANGO_API_BASE_URL', 'http://localhost:8000/api/') # Ensure trailing slash
+DJANGO_API_KEY_FOR_FLASK = os.getenv('DJANGO_API_KEY_FOR_FLASK') # API Key for Flask to authenticate with Django
 
 # Create data directory if it doesn't exist
 os.makedirs(LVE_DATA_DIR, exist_ok=True)
@@ -238,11 +239,11 @@ def get_all_cpanel_users_from_django():
     """
     global all_cpanel_users
     try:
-        url = f"{BACKEND_API}users/cpanel-usernames/"
-        headers = {'X-API-KEY': BACKEND_API_KEY}
+        url = f"{DJANGO_API_BASE_URL}users/cpanel-usernames/"
+        headers = {'X-API-KEY': DJANGO_API_KEY_FOR_FLASK}
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-        users = response.json()
+        users = response.json() # Expected to be a direct list, not {'cpanel_usernames': [...]}
         if isinstance(users, list) and all(isinstance(u, str) for u in users):
             all_cpanel_users = users
             logger.info(f"Successfully fetched {len(all_cpanel_users)} cPanel users from Django.")
@@ -263,88 +264,135 @@ def get_all_cpanel_users_from_django():
 
 def parse_lvetop_output(output, username):
     """
-    Parses lvetop output for a specific user's CPU and RAM usage.
-    lvetop output format is columnar, parsing by position/header is safer but brittle.
-    For simplicity, this assumes fixed column positions based on common lvetop output,
-    but a more robust solution would be needed for production.
-
-    Example lvetop output line:
-    ID       EP   PNO   TNO   CPU%   MEM%   IO   IOPS   NPROC   PMEM    VMEM
-    user1    0    10    15    5.0%   10.5%  0    0      10      100M    200M
+    Parses lvetop output for a specific user's CPU, RAM, IO, IOPS, EP, NPROC usage.
+    This version attempts to find column headers for more robust parsing.
     """
     lines = output.splitlines()
-    header = []
-    data_line = None
+    
+    if not lines:
+        logger.warning("lvetop output is empty.")
+        return 0, 0, 0, 0, 0, 0 # CPU, RAM, IO, IOPS, EP, NPROC
 
-    for i, line in enumerate(lines):
-        if i == 0: # Assuming first line is header
-            header = line.strip().split()
-        if username in line:
-            data_line = line
+    # Identify header line (usually the first non-empty line with many words)
+    header_line = None
+    for line in lines:
+        if len(line.strip().split()) > 5: # Assume header has at least 6 columns
+            header_line = line.strip()
             break
+    
+    if not header_line:
+        logger.warning("Could not identify header line in lvetop output. Falling back to simple parsing.")
+        # If header not found, fall back to fixed indices (less robust)
+        return _parse_lvetop_output_fixed_indices(output, username)
 
+    headers = header_line.split()
+    
+    # Find the data line for the specific username
+    data_line = None
+    for line in lines:
+        # Check if the line starts with the username or contains it as a distinct word
+        if line.strip().startswith(username + ' ') or (' ' + username + ' ' in line and line.strip().split()[0] != username):
+            data_line = line.strip()
+            break
+    
     if not data_line:
-        logger.warning(f"User {username} not found in lvetop output. Returning 0 usage.")
-        return 0, 0 # CPU, RAM
+        logger.warning(f"User '{username}' not found in lvetop output. Returning 0 usage for all metrics.")
+        return 0, 0, 0, 0, 0, 0
+
+    parts = data_line.split()
+    
+    # Map header names to their column index
+    header_map = {h: i for i, h in enumerate(headers)}
+
+    # Initialize usage values
+    cpu_usage = 0.0
+    ram_usage = 0.0 # Will be converted to percentage
+    io_usage = 0.0
+    iops_usage = 0.0
+    ep_usage = 0
+    nproc_usage = 0
 
     try:
-        parts = data_line.strip().split()
-        # Find index of relevant columns from header
-        cpu_index = -1
-        mem_index = -1
-        # Example for finding index:
-        # if 'CPU%' in header: cpu_index = header.index('CPU%')
-        # if 'MEM%' in header: mem_index = header.index('MEM%')
-        # ... but lvetop can be just 'CPU' or 'MEM' and not percentage, or 'PMEM' in MB
+        # CPU usage (usually 'CPU%' or 'CPU')
+        if 'CPU%' in header_map:
+            cpu_usage = float(parts[header_map['CPU%']].strip('%'))
+        elif 'CPU' in header_map:
+            cpu_usage = float(parts[header_map['CPU']])
 
-        # Let's try to parse based on common lvetop output columns:
-        # ID EP PNO TNO CPU MEM IO IOPS NPROC PMEM VMEM
-        # We need CPU (percentage relative to core) and PMEM (physical memory usage in MB/GB)
+        # RAM usage (usually 'MEM' or 'PMEM' in MB/GB)
+        # We need to convert this to a percentage based on allocated limits.
+        # For simplicity, we'll assume a default 1GB (1024MB) limit for percentage conversion.
+        # A more accurate solution would fetch the actual limit from Django model.
+        default_ram_limit_mb = 1024.0 # Example: Assume 1GB default RAM limit for % calculation
+        mem_val_mb = 0.0
+        if 'MEM' in header_map:
+            mem_str = parts[header_map['MEM']]
+            mem_val_mb = float(mem_str.strip('M')) if mem_str.endswith('M') else float(mem_str)
+        elif 'PMEM' in header_map: # Physical Memory
+            mem_str = parts[header_map['PMEM']]
+            mem_val_mb = float(mem_str.strip('M')) if mem_str.endswith('M') else float(mem_str)
+        
+        if mem_val_mb > 0 and default_ram_limit_mb > 0:
+            ram_usage = (mem_val_mb / default_ram_limit_mb) * 100
+            ram_usage = min(100.0, max(0.0, ram_usage)) # Cap at 100%
 
-        # A common lvetop format includes CPU% as a percentage and PMEM/VMEM in MB/GB
-        # We need to find the correct column based on header, or rely on positions (less robust).
-        # Let's assume the simplified `lvetop -p -c 1` output that may show `CPU` and `MEM` (raw values).
-        # If your `lvetop` outputs CPU% and MEM% directly, you can parse them.
-        # Otherwise, you'd get raw numbers (e.g., CPU=50 means 50% of one core, PMEM=100M)
+        # I/O Throughput (usually 'IO')
+        if 'IO' in header_map:
+            io_str = parts[header_map['IO']]
+            io_usage = float(io_str.strip('K')) if io_str.endswith('K') else float(io_str)
+        
+        # IOPS
+        if 'IOPS' in header_map:
+            iops_usage = float(parts[header_map['IOPS']])
 
-        # This parsing is highly dependent on your specific `lvetop` version and output format.
-        # For this example, let's assume it provides `CPU` and `PMEM` in a predictable order (e.g., 5th and 10th elements)
-        # You MUST adjust this based on actual `lvetop` output.
-        # Sample output for `lvetop` often looks like: `ID EP PNO TNO CPU MEM IO IOPS`
-        # Or with `-p`: `ID EP PNO TNO CPU MEM IO IOPS NPROC`
-        # `lveps -p` gives per-process details.
+        # Entry Processes (EP)
+        if 'EP' in header_map:
+            ep_usage = int(parts[header_map['EP']])
+        
+        # Number of Processes (NPROC)
+        if 'NPROC' in header_map:
+            nproc_usage = int(parts[header_map['NPROC']])
 
-        # Let's parse `lvetop` assuming `CPU` (percent of one core) and `MEM` (in MB)
-        # Find the line for the user
-        user_line = [line for line in lines if line.strip().startswith(username + ' ') or ' ' + username + ' ' in line]
-        if not user_line:
-            logger.warning(f"User '{username}' not found in lvetop output for parsing.")
-            return 0, 0
-
-        parts = user_line[0].strip().split()
-
-        # Try to find common columns. This is still brittle.
-        # Better: use `lveinfo --json` if available and parse that.
-        # For now, let's assume `CPU` is 5th column, `MEM` is 6th (0-indexed).
-        # Adjust indices as per your `lvetop` output.
-        if len(parts) >= 6:
-            cpu_val = float(parts[4].strip('%')) if parts[4].endswith('%') else float(parts[4])
-            mem_val_mb = float(parts[5].strip('M')) if parts[5].endswith('M') else float(parts[5])
-
-            # Convert MB to percentage of a typical 1GB (1024MB) default LVE RAM limit
-            # This is a rough estimate; in real scenario, you'd compare to the user's *actual* RAM limit
-            # retrieved from your Django backend or `lvectl limits`.
-            default_ram_limit_mb = 1024 # Example: 1GB limit
-            ram_percentage = (mem_val_mb / default_ram_limit_mb) * 100
-
-            return cpu_val, min(100, max(0, int(ram_percentage)))
-        else:
-            logger.warning(f"Insufficient columns in lvetop output for {username}: {user_line[0]}")
-            return 0, 0 # Fallback
+        logger.info(f"Parsed usage for {username}: CPU={cpu_usage}%, RAM={ram_usage}%, IO={io_usage}KB/s, IOPS={iops_usage}, EP={ep_usage}, NPROC={nproc_usage}")
+        return cpu_usage, ram_usage, io_usage, iops_usage, ep_usage, nproc_usage
 
     except (ValueError, IndexError) as e:
-        logger.error(f"Error parsing lvetop output for {username}: {e}. Line: {data_line}. Returning 0 usage.")
-        return 0, 0
+        logger.error(f"Error parsing lvetop output for {username} using headers: {e}. Data line: '{data_line}'. Headers: {headers}. Returning 0 usage for all metrics.")
+        return 0, 0, 0, 0, 0, 0
+
+def _parse_lvetop_output_fixed_indices(output, username):
+    """
+    Fallback parsing for lvetop output using fixed indices. Less robust.
+    Used if header parsing fails.
+    """
+    lines = output.splitlines()
+    for line in lines:
+        if username in line:
+            parts = line.strip().split()
+            try:
+                # These indices are highly speculative and depend on actual lvetop output
+                # Example lvetop output: ID EP PNO TNO CPU MEM IO IOPS
+                # If this is the format, indices might be: CPU=4, MEM=5, IO=6, IOPS=7, EP=1, NPROC=2
+                cpu_usage = float(parts[4].strip('%')) if parts[4].endswith('%') else float(parts[4])
+                mem_str = parts[5]
+                mem_val_mb = float(mem_str.strip('M')) if mem_str.endswith('M') else float(mem_str)
+                default_ram_limit_mb = 1024.0 # Same assumption as above
+                ram_usage = (mem_val_mb / default_ram_limit_mb) * 100
+                ram_usage = min(100.0, max(0.0, ram_usage))
+
+                io_usage = float(parts[6].strip('K')) if parts[6].endswith('K') else float(parts[6])
+                iops_usage = float(parts[7])
+                ep_usage = int(parts[1])
+                nproc_usage = int(parts[2]) # PNO is often nproc count
+
+                logger.warning(f"Parsed usage for {username} using fixed indices (fallback).")
+                return cpu_usage, ram_usage, io_usage, iops_usage, ep_usage, nproc_usage
+            except (ValueError, IndexError) as e:
+                logger.error(f"Fixed-index parsing also failed for {username}: {e}. Line: '{line}'. Returning 0 usage.")
+                return 0, 0, 0, 0, 0, 0
+    logger.warning(f"User '{username}' not found in lvetop output for fixed-index parsing.")
+    return 0, 0, 0, 0, 0, 0
+
 
 def fetch_lve_usage_for_users(users_in_batch):
     """
@@ -352,10 +400,10 @@ def fetch_lve_usage_for_users(users_in_batch):
     Returns a list of dictionaries with usage data.
     """
     collected_data = []
-
-    # Run lvetop once for all users to get current snapshot
-    success, stdout, stderr = run_command(['sudo', '/usr/sbin/lvetop', '-p']) # '-p' for processes, can include more details
-
+    
+    # Run lvetop without any problematic flags
+    success, stdout, stderr = run_command(['sudo', '/usr/sbin/lvetop']) 
+    
     if not success:
         logger.error(f"Failed to get lvetop output: {stderr}. Cannot collect usage for batch.")
         # Return empty data or mock data for this batch
@@ -364,16 +412,24 @@ def fetch_lve_usage_for_users(users_in_batch):
                 "cpanel_username": user,
                 "cpu_usage": 0, # Fallback
                 "ram_usage": 0, # Fallback
+                "io_usage": 0,
+                "iops_usage": 0,
+                "ep_usage": 0,
+                "nproc_usage": 0,
                 "timestamp": datetime.now().isoformat()
             })
         return collected_data
 
     for user in users_in_batch:
-        cpu_usage, ram_usage = parse_lvetop_output(stdout, user)
+        cpu_usage, ram_usage, io_usage, iops_usage, ep_usage, nproc_usage = parse_lvetop_output(stdout, user)
         collected_data.append({
             "cpanel_username": user,
             "cpu_usage": cpu_usage,
             "ram_usage": ram_usage,
+            "io_usage": io_usage,
+            "iops_usage": iops_usage,
+            "ep_usage": ep_usage,
+            "nproc_usage": nproc_usage,
             "timestamp": datetime.now().isoformat()
         })
     return collected_data
@@ -402,7 +458,7 @@ def delete_old_usage_files():
                 file_time = datetime.strptime(file_timestamp_str, '%Y%m%d_%H%M%S.%f')
             except ValueError:
                 file_time = datetime.strptime(file_timestamp_str, '%Y%m%d_%H%M%S')
-
+            
             if file_time < cutoff_time:
                 os.remove(filename)
                 logger.info(f"Deleted old LVE usage file: {filename}")
@@ -411,8 +467,8 @@ def delete_old_usage_files():
 
 def send_usage_to_django(data):
     """Sends collected LVE usage data to the Django backend API."""
-    if not BACKEND_API_KEY:
-        logger.error("BACKEND_API_KEY is not set. Cannot send data to Django.")
+    if not DJANGO_API_KEY_FOR_FLASK:
+        logger.error("DJANGO_API_KEY_FOR_FLASK is not set. Cannot send data to Django.")
         return False
 
     if not data:
@@ -420,10 +476,10 @@ def send_usage_to_django(data):
         return True # Considered successful if nothing to send
 
     try:
-        url = f"{BACKEND_API}lve-usage/store/" # Assuming this endpoint exists in Django
+        url = f"{DJANGO_API_BASE_URL}lve-usage/store/" # Assuming this endpoint exists in Django
         headers = {
             'Content-Type': 'application/json',
-            'X-API-KEY': BACKEND_API_KEY # Django API key for this Flask agent
+            'X-API-KEY': DJANGO_API_KEY_FOR_FLASK # Django API key for this Flask agent
         }
         response = requests.post(url, json=data, headers=headers, timeout=30)
         response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
@@ -457,34 +513,34 @@ def collect_lve_data_batch():
         if num_users == 0:
             logger.info("No users to process in all_cpanel_users list. Skipping batch.")
             return
-
+            
         batch_size = (num_users + LVE_BATCH_DIVISOR - 1) // LVE_BATCH_DIVISOR # Ceil division
-
+        
         start_index = current_batch_index * batch_size
         end_index = min(start_index + batch_size, num_users)
-
+        
         users_in_batch = all_cpanel_users[start_index:end_index]
-
+        
         if not users_in_batch:
             logger.info("Current batch is empty. This might happen if user list changed or batching logic misfired.")
             return
 
         logger.info(f"Processing batch {current_batch_index + 1}/{LVE_BATCH_DIVISOR} for {len(users_in_batch)} users.")
-
+        
         # 1. Fetch LVE usage for the current batch
         collected_usage_data = fetch_lve_usage_for_users(users_in_batch)
-
+        
         # 2. Save usage to a temporary file
         if collected_usage_data:
             save_usage_to_file(collected_usage_data)
-
+        
         # 3. Send usage data to Django
         if collected_usage_data:
             send_usage_to_django(collected_usage_data)
-
+        
         # Increment batch index
         current_batch_index += 1
-
+        
         # Check if all batches in a cycle are complete
         if current_batch_index >= LVE_BATCH_DIVISOR:
             logger.info(f"Completed a full cycle of LVE collection. Cycle started at {last_full_cycle_start_time}")
@@ -571,11 +627,9 @@ def set_lve_user_limits():
         return jsonify({"error": "Failed to update LVE limits", "details": stderr or stdout or "Unknown error"}), 500
 
 if __name__ == '__main__':
-    import threading # Import here if not already at the top for clarity
-
     # Initialize the list of users once at startup
     get_all_cpanel_users_from_django()
-
+    
     # Start the scheduler
     # The 'interval' trigger runs the job every N seconds.
     scheduler.add_job(
@@ -593,28 +647,8 @@ if __name__ == '__main__':
     logger.info(f"Starting cPanel Agent Flask API on {FLASK_HOST}:{FLASK_PORT}")
     # For production, use Gunicorn via systemd as configured in the bash script
     app.run(host=FLASK_HOST, port=FLASK_PORT, debug=(os.getenv('FLASK_DEBUG', 'False').lower() == 'true'))
-EOF
-    chown -R "$API_USER:$API_USER" "$APP_DIR"
-    chmod -R 750 "$APP_DIR" # User rwx, group rx, other ---
-    chmod 640 "$APP_DIR/.env" # Restrict .env file access
 
-    log_message "Flask app structure created. Main app file: $APP_DIR/app.py"
-}
 
-setup_systemd_service() {
-    log_message "Setting up systemd service for the Flask agent..."
-    # Generate a secret key for API authentication if not set
-    API_SECRET_KEY=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 32 ; echo '')
-    # Append to .env (or update if exists)
-    if grep -q "API_KEY=" "$APP_DIR/.env"; then
-        sed -i "s/^API_KEY=.*/API_KEY=$API_SECRET_KEY/" "$APP_DIR/.env"
-    else
-        echo "API_KEY=$API_SECRET_KEY" >> "$APP_DIR/.env"
-    fi
-    chown "$API_USER:$API_USER" "$APP_DIR/.env"
-    chmod 600 "$APP_DIR/.env" # Ensure .env is private
-
-    SERVICE_FILE="/etc/systemd/system/cpanel_agent.service"
     cat << EOF > "$SERVICE_FILE"
 [Unit]
 Description=cPanel Agent Flask API
